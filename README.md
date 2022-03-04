@@ -1,7 +1,7 @@
 # Boost Supervised Pretraining for Visual Transfer Learning: Implications of Self-Supervised Contrastive Representation Learning
 This repo contains the reference source code for the paper [**Boost Supervised Pretraining for Visual Transfer Learning: Implications of Self-Supervised Contrastive Representation Learning**] in AAAI2021. Our implementation is based on [Pytorch](https://pytorch.org/).
 <div align="center">
-	<img src="./overview.png" alt="Editor" width="600">
+	<img src="./overview.png" alt="Editor" width="300">
 </div>
 
 This repository was built off of [Contrastive Multiview Coding](https://github.com/HobbitLong/CMC).
