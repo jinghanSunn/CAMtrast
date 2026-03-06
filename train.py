@@ -4,156 +4,182 @@ Training MoCo and Instance Discrimination
 InsDis: Unsupervised feature learning via non-parametric instance discrimination
 MoCo: Momentum Contrast for Unsupervised Visual Representation Learning
 Feature Projection
-
 """
 from __future__ import print_function
-from PIL import ImageFile
-ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+import argparse
 import os
 import sys
 import time
+import warnings
+
+import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
-import argparse
-import socket
-import math
-import numpy as np
-import cv2
-
-# import tensorboard_logger as tb_logger
-
-from torchvision import transforms, datasets
-import torchvision.models as models
-import torch.optim as optim
-from torchtoolbox.transform import Cutout
-from util import  AverageMeter, mixup_data, adjust_learning_rate
-from PIL import Image
-
-from models.resnet import InsResNet50Sp
-from NCE.NCEAverage import MemoryInsDis
-from NCE.NCEAverage import MemoryMoCo
-from NCE.NCECriterion import NCECriterion
-from NCE.NCECriterion import NCESoftmaxLoss
+from PIL import ImageFile
+from torchvision import transforms
 
 from dataset import ImageRealFolderInstance
-from resnet_cmc import resnet50
 from models.simsiam import SimSiam
-
-import moco.builder
+from NCE.NCEAverage import MemoryInsDis, MemoryMoCo
+from resnet_cmc import resnet50
+from util import AverageMeter, adjust_learning_rate, returnCAM_tensor
 import moco.loader
 
-from util import returnCAM_tensor
+# Allow loading of truncated images
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-try:
-    from apex import amp, optimizers
-except ImportError:
-    pass
-"""
-TODO: python 3.6 ModuleNotFoundError
-"""
-import warnings
+# Suppress warnings
 warnings.filterwarnings("ignore")
 
+try:
+    from apex import amp
+except ImportError:
+    amp = None
+
 def parse_option():
-
-    hostname = socket.gethostname()
-
+    """Parse command line arguments for training configuration."""
     parser = argparse.ArgumentParser('argument for training')
 
-    parser.add_argument('--print_freq', type=int, default=10, help='print frequency')
-    parser.add_argument('--tb_freq', type=int, default=500, help='tb frequency')
-    parser.add_argument('--save_freq', type=int, default=10, help='save frequency')
-    parser.add_argument('--batch_size', type=int, default=64, help='batch_size')
-    parser.add_argument('--num_workers', type=int, default=18, help='num of workers to use')
-    parser.add_argument('--epochs', type=int, default=240, help='number of training epochs')
+    # Training parameters
+    parser.add_argument('--print_freq', type=int, default=10,
+                        help='print frequency')
+    parser.add_argument('--tb_freq', type=int, default=500,
+                        help='tensorboard frequency')
+    parser.add_argument('--save_freq', type=int, default=10,
+                        help='save frequency')
+    parser.add_argument('--batch_size', type=int, default=64,
+                        help='batch size')
+    parser.add_argument('--num_workers', type=int, default=18,
+                        help='number of workers to use')
+    parser.add_argument('--epochs', type=int, default=240,
+                        help='number of training epochs')
 
-    # optimization
-    parser.add_argument('--learning_rate', type=float, default=0.05, help='learning rate')
-    parser.add_argument('--lr_decay_epochs', type=str, default='60,80', help='where to decay lr, can be a list')
-    parser.add_argument('--lr_decay_rate', type=float, default=0.1, help='decay rate for learning rate')
-    parser.add_argument('--beta1', type=float, default=0.5, help='beta1 for adam')
-    parser.add_argument('--beta2', type=float, default=0.999, help='beta2 for Adam')
-    parser.add_argument('--weight_decay', type=float, default=5e-4, help='weight decay')
-    parser.add_argument('--momentum', type=float, default=0.9, help='momentum')
+    # Optimization parameters
+    parser.add_argument('--learning_rate', type=float, default=0.05,
+                        help='learning rate')
+    parser.add_argument('--lr_decay_epochs', type=str, default='60,80',
+                        help='where to decay lr, can be a list')
+    parser.add_argument('--lr_decay_rate', type=float, default=0.1,
+                        help='decay rate for learning rate')
+    parser.add_argument('--beta1', type=float, default=0.5,
+                        help='beta1 for adam')
+    parser.add_argument('--beta2', type=float, default=0.999,
+                        help='beta2 for Adam')
+    parser.add_argument('--weight_decay', type=float, default=5e-4,
+                        help='weight decay')
+    parser.add_argument('--momentum', type=float, default=0.9,
+                        help='momentum')
 
-    # crop
-    parser.add_argument('--crop', type=float, default=0.2, help='minimum crop')
+    # Data augmentation
+    parser.add_argument('--crop', type=float, default=0.2,
+                        help='minimum crop')
+    parser.add_argument('--aug', type=str, default='CJ',
+                        choices=['NULL', "cjv2"],
+                        help='augmentation setting')
 
-    # dataset
-    parser.add_argument('--dataset', type=str, default='imagenet100', choices=['imagenet100', 'imagenet', 'tieredimage', 'cifar', 'imagenet'])
-    parser.add_argument('--data_folder', type=str, default='./mini_imagenet')
-    parser.add_argument('--n_way', type=int, default=64)
-    parser.add_argument('--image_num', type=int, default=1300, help='each class train images')
-    # resume
+    # Dataset parameters
+    parser.add_argument('--dataset', type=str, default='imagenet100',
+                        choices=['imagenet100', 'imagenet', 'tieredimage', 'cifar'],
+                        help='dataset name')
+    parser.add_argument('--data_folder', type=str, default='./mini_imagenet',
+                        help='path to dataset folder')
+    parser.add_argument('--n_way', type=int, default=64,
+                        help='number of classes')
+    parser.add_argument('--image_num', type=int, default=1300,
+                        help='number of images per class for training')
+
+    # Resume training
     parser.add_argument('--resume', default='', type=str, metavar='PATH',
                         help='path to latest checkpoint (default: none)')
 
-    # augmentation setting
-    parser.add_argument('--aug', type=str, default='CJ', choices=['NULL', "cjv2"])
+    # Training optimization
+    parser.add_argument('--warm', action='store_true',
+                        help='add warm-up setting')
+    parser.add_argument('--amp', action='store_true',
+                        help='use mixed precision training')
+    parser.add_argument('--opt_level', type=str, default='O2',
+                        choices=['O1', 'O2'],
+                        help='apex optimization level')
 
-    # warm up
-    parser.add_argument('--warm', action='store_true', help='add warm-up setting')
-    parser.add_argument('--amp', action='store_true', help='using mixed precision')
-    parser.add_argument('--opt_level', type=str, default='O2', choices=['O1', 'O2'])
+    # Model definition
+    parser.add_argument('--model', type=str, default='resnet50',
+                        choices=['resnet50', 'resnet50st', 'resnet50x2', 'resnet50x4'],
+                        help='model architecture')
+    parser.add_argument('--model_name', type=str,
+                        help='name for saving model')
 
-    # model definition
-    parser.add_argument('--model', type=str, default='resnet50', choices=['resnet50', 'resnet50st','resnet50x2', 'resnet50x4'])
-    parser.add_argument('--model_name', type=str)
+    # Loss function parameters
+    parser.add_argument('--softmax', action='store_true',
+                        help='use softmax contrastive loss rather than NCE')
+    parser.add_argument('--nce_k', type=int, default=16384,
+                        help='number of negative samples for NCE')
+    parser.add_argument('--nce_t', type=float, default=0.07,
+                        help='temperature for NCE')
+    parser.add_argument('--nce_m', type=float, default=0.5,
+                        help='momentum for NCE')
 
-    # loss function
-    parser.add_argument('--softmax', action='store_true', help='using softmax contrastive loss rather than NCE')
-    parser.add_argument('--nce_k', type=int, default=16384)
-    parser.add_argument('--nce_t', type=float, default=0.07)
-    parser.add_argument('--nce_m', type=float, default=0.5)
-
-    # memory setting
-    parser.add_argument('--moco', action='store_true', help='using MoCo (otherwise Instance Discrimination)')
-    parser.add_argument('--alpha', type=float, default=0.999, help='exponential moving average weight')
+    # Memory bank settings
+    parser.add_argument('--moco', action='store_true',
+                        help='use MoCo (otherwise Instance Discrimination)')
+    parser.add_argument('--alpha', type=float, default=0.999,
+                        help='exponential moving average weight')
 
     # GPU setting
-    parser.add_argument('--gpu', default=None, type=int, help='GPU id to use.')
+    parser.add_argument('--gpu', default=None, type=int,
+                        help='GPU id to use')
 
-    # loss setting
-    parser.add_argument('--unif', type=float, default=0, help='weight for uniform loss')
-    parser.add_argument('--mixup', action='store_true', help='manifold mixup')
-    parser.add_argument('--mix_alpha', type=float, default=1.0, help='manifold mixup alpha')
-    parser.add_argument('--layer_mix', type=int, default=None, help='which layer to mix')
-    
-    # heatmap setting
-    parser.add_argument('--epoch_t', type=int, default=100, help='epoch threshold')
-    parser.add_argument('--cam_mode', type=str, default='reverse', help='heatmap process mode')
-    parser.add_argument('--cam_t', type=float, default=0.5, help="heatmap process threshold, if mode=='hard_thresh'")
-    parser.add_argument('--cam_momentum', action='store_true', help='momentum update heatmap')
-    parser.add_argument('--cam_k', type=float, default=0.9, help="momentum update heatmap ratio")
-    parser.add_argument('--cam_aug', action='store_true', help='augment after cam aug')
+    # Additional loss settings
+    parser.add_argument('--unif', type=float, default=0,
+                        help='weight for uniform loss')
+    parser.add_argument('--mixup', action='store_true',
+                        help='use manifold mixup')
+    parser.add_argument('--mix_alpha', type=float, default=1.0,
+                        help='manifold mixup alpha')
+    parser.add_argument('--layer_mix', type=int, default=None,
+                        help='which layer to mix')
 
-    # simsiam specific configs:
+    # CAM (Class Activation Map) settings
+    parser.add_argument('--epoch_t', type=int, default=100,
+                        help='epoch threshold for CAM')
+    parser.add_argument('--cam_mode', type=str, default='reverse',
+                        help='heatmap process mode')
+    parser.add_argument('--cam_t', type=float, default=0.5,
+                        help="heatmap process threshold, if mode=='hard_thresh'")
+    parser.add_argument('--cam_momentum', action='store_true',
+                        help='use momentum update for heatmap')
+    parser.add_argument('--cam_k', type=float, default=0.9,
+                        help='momentum update heatmap ratio')
+    parser.add_argument('--cam_aug', action='store_true',
+                        help='augment after CAM augmentation')
+
+    # SimSiam specific configs
     parser.add_argument('--dim', default=2048, type=int,
-                    help='feature dimension (default: 2048)')
+                        help='feature dimension (default: 2048)')
     parser.add_argument('--pred-dim', default=512, type=int,
-                    help='hidden dimension of the predictor (default: 512)')
+                        help='hidden dimension of the predictor (default: 512)')
 
     opt = parser.parse_args()
 
-    # set the path according to the environment
-    # if hostname.startswith('visiongpu'):
+    # Set model and tensorboard paths
     opt.model_path = '/model'
     opt.tb_path = '/model'
 
-    if opt.dataset == 'imagenet':
-        if 'alexnet' not in opt.model:
-            opt.crop = 0.08
+    # Adjust crop size for ImageNet
+    if opt.dataset == 'imagenet' and 'alexnet' not in opt.model:
+        opt.crop = 0.08
 
+    # Parse learning rate decay epochs
     iterations = opt.lr_decay_epochs.split(',')
-    opt.lr_decay_epochs = list([])
-    for it in iterations:
-        opt.lr_decay_epochs.append(int(it))
+    opt.lr_decay_epochs = [int(it) for it in iterations]
 
+    # Set loss method
     opt.method = 'softmax' if opt.softmax else 'nce'
 
     print(opt)
     print(opt.model_name)
 
+    # Create model and tensorboard directories
     opt.model_folder = os.path.join(opt.model_path, opt.model_name)
     if not os.path.isdir(opt.model_folder):
         os.makedirs(opt.model_folder)
@@ -161,18 +187,35 @@ def parse_option():
     opt.tb_folder = os.path.join(opt.tb_path, opt.model_name)
     if not os.path.isdir(opt.tb_folder):
         os.makedirs(opt.tb_folder)
-    print("save model to", opt.model_folder)
+
+    print("Save model to:", opt.model_folder)
     return opt
 
 
 def moment_update(model, model_ema, m):
-    """ model_ema = m * model_ema + (1 - m) model """
+    """
+    Update model_ema parameters using exponential moving average.
+
+    Args:
+        model: Current model
+        model_ema: Exponential moving average model
+        m: Momentum coefficient
+    """
     for p1, p2 in zip(model.parameters(), model_ema.parameters()):
-        p2.data.mul_(m).add_(1-m, p1.detach().data)
+        p2.data.mul_(m).add_(1 - m, p1.detach().data)
 
 
 def get_shuffle_ids(bsz):
-    """generate shuffle ids for ShuffleBN"""
+    """
+    Generate shuffle indices for ShuffleBN.
+
+    Args:
+        bsz: Batch size
+
+    Returns:
+        forward_inds: Forward shuffle indices
+        backward_inds: Backward shuffle indices
+    """
     forward_inds = torch.randperm(bsz).long().cuda()
     backward_inds = torch.zeros(bsz).long().cuda()
     value = torch.arange(bsz).long().cuda()
@@ -181,32 +224,33 @@ def get_shuffle_ids(bsz):
 
 
 def main():
-
+    """Main training function."""
     args = parse_option()
 
     if args.gpu is not None:
         print("Use GPU: {} for training".format(args.gpu))
 
-    # set the data loader
+    # Set data folder path
     if args.dataset == 'imagenet100':
         data_folder = os.path.join(args.data_folder, 'train')
     else:
         data_folder = args.data_folder
 
+    # Define image transformations
     image_size = 84
     mean = [0.485, 0.456, 0.406]
     std = [0.229, 0.224, 0.225]
     normalize = transforms.Normalize(mean=mean, std=std)
 
     train_transform = transforms.Compose([
-    transforms.RandomResizedCrop(image_size, scale=(args.crop, 1.)),
-    transforms.RandomGrayscale(p=0.2),
-    transforms.ColorJitter(0.4, 0.4, 0.4, 0.4),
-    transforms.RandomApply([moco.loader.GaussianBlur([.1, 2.])], p=0.5),
-    transforms.RandomHorizontalFlip(),
-    transforms.ToTensor(),
-    normalize,
-        ])
+        transforms.RandomResizedCrop(image_size, scale=(args.crop, 1.)),
+        transforms.RandomGrayscale(p=0.2),
+        transforms.ColorJitter(0.4, 0.4, 0.4, 0.4),
+        transforms.RandomApply([moco.loader.GaussianBlur([.1, 2.])], p=0.5),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        normalize,
+    ])
     
 
     train_dataset = ImageRealFolderInstance('train', transform=train_transform, return_idx=True)
@@ -216,8 +260,7 @@ def main():
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, pin_memory=True, sampler=train_sampler)
-
-    # create model and optimizer
+    # Create model and optimizer
     n_data = len(train_dataset)
 
     if args.model == 'resnet50':
@@ -225,83 +268,96 @@ def main():
         if args.moco:
             model_ema = resnet50()
     else:
-        raise NotImplementedError('model not supported {}'.format(args.model))
-    
+        raise NotImplementedError('Model not supported: {}'.format(args.model))
+
     model = SimSiam(encoder, args.dim, args.pred_dim)
     encoder = model.encoder
     model = torch.nn.DataParallel(model)
     encoder = torch.nn.DataParallel(encoder)
 
-
-    # copy weights from `model' to `model_ema'
+    # Copy weights from model to model_ema
     if args.moco:
         moment_update(model, model_ema, 0)
-    
 
-    # set the contrast memory and criterion
+    # Set up contrast memory and criterion
     if args.moco:
-        contrast = MemoryMoCo(128, n_data, args.nce_k, args.nce_t, args.softmax).cuda(args.gpu)
+        contrast = MemoryMoCo(
+            128, n_data, args.nce_k, args.nce_t, args.softmax
+        ).cuda(args.gpu)
     else:
-        contrast = MemoryInsDis(128, n_data, args.nce_k, args.nce_t, args.nce_m, args.softmax).cuda(args.gpu)
+        contrast = MemoryInsDis(
+            128, n_data, args.nce_k, args.nce_t, args.nce_m, args.softmax
+        ).cuda(args.gpu)
 
-    criterion = torch.nn.CrossEntropyLoss()
-    criterion = criterion.cuda(args.gpu)
+    criterion = torch.nn.CrossEntropyLoss().cuda(args.gpu)
     criterion_simsiam = torch.nn.CosineSimilarity(dim=1).cuda(args.gpu)
 
     model = model.cuda()
 
-    optim_params = [{'params': model.module.encoder.parameters(), 'fix_lr': False},
-                        {'params': model.module.predictor.parameters(), 'fix_lr': True}]
+    # Set up optimizer with different learning rates for encoder and predictor
+    optim_params = [
+        {'params': model.module.encoder.parameters(), 'fix_lr': False},
+        {'params': model.module.predictor.parameters(), 'fix_lr': True}
+    ]
 
-    optimizer = torch.optim.SGD(optim_params,
-                                lr=args.learning_rate,
-                                momentum=args.momentum,
-                                weight_decay=args.weight_decay)
+    optimizer = torch.optim.SGD(
+        optim_params,
+        lr=args.learning_rate,
+        momentum=args.momentum,
+        weight_decay=args.weight_decay
+    )
 
     cudnn.benchmark = True
 
-    if args.amp:
-        model, optimizer = amp.initialize(model, optimizer, opt_level=args.opt_level)
+    # Initialize mixed precision training if enabled
+    if args.amp and amp is not None:
+        model, optimizer = amp.initialize(
+            model, optimizer, opt_level=args.opt_level
+        )
         if args.moco:
-            optimizer_ema = torch.optim.SGD(model_ema.parameters(),
-                                            lr=0,
-                                            momentum=0,
-                                            weight_decay=0)
-            model_ema, optimizer_ema = amp.initialize(model_ema, optimizer_ema, opt_level=args.opt_level)
+            optimizer_ema = torch.optim.SGD(
+                model_ema.parameters(), lr=0, momentum=0, weight_decay=0
+            )
+            model_ema, optimizer_ema = amp.initialize(
+                model_ema, optimizer_ema, opt_level=args.opt_level
+            )
 
-    # optionally resume from a checkpoint
+    # Optionally resume from a checkpoint
     args.start_epoch = 1
     if args.resume:
         if os.path.isfile(args.resume):
-            print("=> loading checkpoint '{}'".format(args.resume))
+            print("=> Loading checkpoint '{}'".format(args.resume))
             checkpoint = torch.load(args.resume, map_location='cpu')
             args.start_epoch = checkpoint['epoch'] + 1
             model.load_state_dict(checkpoint['model'])
             if args.moco:
                 model_ema.load_state_dict(checkpoint['model_ema'])
 
-            if args.amp and checkpoint['opt'].amp:
-                print('==> resuming amp state_dict')
+            if args.amp and amp is not None and checkpoint['opt'].amp:
+                print('==> Resuming amp state_dict')
                 amp.load_state_dict(checkpoint['amp'])
 
-            print("=> loaded successfully '{}' (epoch {})"
-                  .format(args.resume, checkpoint['epoch']))
+            print("=> Loaded successfully '{}' (epoch {})".format(
+                args.resume, checkpoint['epoch']))
             del checkpoint
             torch.cuda.empty_cache()
         else:
-            print("=> no checkpoint found at '{}'".format(args.resume))
+            print("=> No checkpoint found at '{}'".format(args.resume))
 
+    # Training loop
     for epoch in range(args.start_epoch, args.epochs + 1):
-
         adjust_learning_rate(epoch, args, optimizer)
-        print("==> training...")
+        print("==> Training...")
 
         time1 = time.time()
-        loss, prob = train(epoch, train_loader, model, contrast, criterion, criterion_simsiam, optimizer, args)
+        loss, prob = train(
+            epoch, train_loader, model, contrast, criterion,
+            criterion_simsiam, optimizer, args
+        )
         time2 = time.time()
-        print('epoch {}, total time {:.2f}'.format(epoch, time2 - time1))
+        print('Epoch {}, total time {:.2f}s'.format(epoch, time2 - time1))
 
-        # save model
+        # Save model checkpoint
         if epoch % args.save_freq == 0:
             print('==> Saving...')
             state = {
@@ -313,27 +369,37 @@ def main():
             }
             if args.moco:
                 state['model_ema'] = model_ema.state_dict()
-            if args.amp:
+            if args.amp and amp is not None:
                 state['amp'] = amp.state_dict()
-            save_file = os.path.join(args.model_folder, 'ckpt_epoch_{epoch}.pth'.format(epoch=epoch))
+            save_file = os.path.join(
+                args.model_folder, 'ckpt_epoch_{}.pth'.format(epoch)
+            )
             torch.save(state, save_file)
-            print("save model to", save_file)
-            # help release GPU memory
+            print("Saved model to:", save_file)
+            # Release GPU memory
             del state
             torch.cuda.empty_cache()
 
 
-def train(epoch, train_loader, model, contrast, criterion, criterion_simsiam, optimizer, opt):
+def train(epoch, train_loader, model, contrast, criterion, criterion_simsiam,
+          optimizer, opt):
     """
-    one epoch training for instance discrimination
+    Train for one epoch using instance discrimination.
+
+    Args:
+        epoch: Current epoch number
+        train_loader: Training data loader
+        model: Model to train
+        contrast: Contrast memory module
+        criterion: Loss criterion
+        criterion_simsiam: SimSiam loss criterion
+        optimizer: Optimizer
+        opt: Training options
+
+    Returns:
+        Average loss and accuracy for the epoch
     """
     model.train()
-
-    def set_bn_train(m):
-        classname = m.__class__.__name__
-        if classname.find('BatchNorm') != -1:
-            m.train()
-    # model_ema.apply(set_bn_train)
 
     batch_time = AverageMeter()
     data_time = AverageMeter()
@@ -347,135 +413,168 @@ def train(epoch, train_loader, model, contrast, criterion, criterion_simsiam, op
 
         bsz = inputs.size(0)
 
-        # ori_img = ori_img.float()
         inputs = inputs.float()
         if opt.gpu is not None:
             inputs = inputs.cuda(opt.gpu, non_blocking=True)
         else:
             inputs = inputs.cuda()
         y = y.cuda()
-        # ===================forward=====================
 
-        # ids for ShuffleBN
+        # Forward pass
         shuffle_ids, reverse_ids = get_shuffle_ids(bsz)
-        
+
         _, output1, feature = model.encoder(inputs, notsimsiam=True)
-        
+
         loss = criterion(output1, y.long())
-        prob = (torch.eq(output1.argmax(dim=1), y).sum().item())/y.shape[0]
+        prob = (torch.eq(output1.argmax(dim=1), y).sum().item()) / y.shape[0]
 
-
-        # ===================backward=====================
+        # Backward pass
         optimizer.zero_grad()
-        if opt.amp:
+        if opt.amp and amp is not None:
             with amp.scale_loss(loss, optimizer) as scaled_loss:
                 scaled_loss.backward()
         else:
             loss.backward()
         optimizer.step()
 
-        # ===================meters=====================
+        # Update meters
         loss_meter.update(loss.item(), bsz)
         prob_meter.update(prob, bsz)
-
-        # moment_update(model, model_ema, opt.alpha)
 
         torch.cuda.synchronize()
         batch_time.update(time.time() - end)
         end = time.time()
 
-        # print info
+        # Print training info
         if (idx + 1) % opt.print_freq == 0:
             print('Train: [{0}][{1}/{2}]\t'
                   'BT {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
                   'DT {data_time.val:.3f} ({data_time.avg:.3f})\t'
                   'loss {loss.val:.3f} ({loss.avg:.3f})\t'
                   'prob {prob.val:.3f} ({prob.avg:.3f})'.format(
-                   epoch, idx + 1, len(train_loader), batch_time=batch_time,
-                   data_time=data_time, loss=loss_meter, prob=prob_meter))
-            # print(out.shape)
+                      epoch, idx + 1, len(train_loader),
+                      batch_time=batch_time, data_time=data_time,
+                      loss=loss_meter, prob=prob_meter))
             sys.stdout.flush()
-        
-        # ===================new anti-cam train===================== # 
-        if epoch>=opt.epoch_t:
+        # Anti-CAM training (after epoch threshold)
+        if epoch >= opt.epoch_t:
             antiCAMs = getCAM(inputs, output1, feature, model.encoder, opt)
 
-            # ===================new anti-cam forward=====================
+            # Anti-CAM forward pass
             p1, p2, z1, z2, _, anti_output = model(x1=inputs, x2=antiCAMs)
-            sim_loss = -(criterion_simsiam(p1, z2).mean() + criterion_simsiam(p2, z1).mean()) * 0.5
+            sim_loss = -(criterion_simsiam(p1, z2).mean() +
+                         criterion_simsiam(p2, z1).mean()) * 0.5
             anti_loss = criterion(anti_output, y.long())
             loss = anti_loss + sim_loss
-            prob = (torch.eq(anti_output.argmax(dim=1), y).sum().item())/y.shape[0]
+            prob = (torch.eq(anti_output.argmax(dim=1), y).sum().item()) / y.shape[0]
 
-            # ===================backward=====================
+            # Backward pass
             optimizer.zero_grad()
-            if opt.amp:
+            if opt.amp and amp is not None:
                 with amp.scale_loss(loss, optimizer) as scaled_loss:
                     scaled_loss.backward()
             else:
                 loss.backward()
             optimizer.step()
 
-            # ===================meters=====================
+            # Update meters
             loss_meter.update(loss.item(), bsz)
             prob_meter.update(prob, bsz)
-
-            # moment_update(model, model_ema, opt.alpha)
 
             torch.cuda.synchronize()
             batch_time.update(time.time() - end)
             end = time.time()
 
-            # print info
+            # Print training info
             if (idx + 1) % opt.print_freq == 0:
                 print('Train: [{0}][{1}/{2}]\t'
-                    'BT {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                    'DT {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                    'loss {loss.val:.3f} ({loss.avg:.3f})\t'
-                    'prob {prob.val:.3f} ({prob.avg:.3f})'.format(
-                    epoch, idx + 1, len(train_loader), batch_time=batch_time,
-                    data_time=data_time, loss=loss_meter, prob=prob_meter))
-                # print(out.shape)
+                      'BT {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                      'DT {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                      'loss {loss.val:.3f} ({loss.avg:.3f})\t'
+                      'prob {prob.val:.3f} ({prob.avg:.3f})'.format(
+                          epoch, idx + 1, len(train_loader),
+                          batch_time=batch_time, data_time=data_time,
+                          loss=loss_meter, prob=prob_meter))
                 sys.stdout.flush()
-        
 
     return loss_meter.avg, prob_meter.avg
 
 
 def getCAM(inputs, output1, feature, model, opt, train_transform=None):
-    logits = output1.detach() # [bs, n_way]
+    """
+    Generate Class Activation Maps (CAM) for inputs.
+
+    Args:
+        inputs: Input images
+        output1: Model outputs
+        feature: Feature maps
+        model: Model
+        opt: Options
+        train_transform: Optional transform
+
+    Returns:
+        Anti-CAM processed images
+    """
+    logits = output1.detach()  # [bs, n_way]
     features_blobs = feature.detach()
-    params = list(model.parameters())[-2] 
-    weight_softmax = params.detach().data.squeeze() # [n_way, nce_k]
-    if opt.dataset == 'miniimagenet' or opt.dataset == 'tieredimage' or opt.dataset == 'imagenet100':
-        size_upsample = (84,84)
+    params = list(model.parameters())[-2]
+    weight_softmax = params.detach().data.squeeze()  # [n_way, nce_k]
+
+    if opt.dataset in ['miniimagenet', 'tieredimage', 'imagenet100']:
+        size_upsample = (84, 84)
 
     for i, logit in enumerate(logits):
         h_x = torch.nn.functional.softmax(logit, dim=0).data
         probs, idx_cam = h_x.sort(0, True)
 
-
-        CAM = returnCAM_tensor(features_blobs[i], weight_softmax, [idx_cam[0]], size_upsample=size_upsample, use_gpu=True)
+        CAM = returnCAM_tensor(
+            features_blobs[i], weight_softmax, [idx_cam[0]],
+            size_upsample=size_upsample, use_gpu=True
+        )
+        anti_cam = antiCamFunction(CAM, mode=opt.cam_mode, t=opt.cam_t)
         if i == 0:
-            antiCAMs = torch.mul(antiCamFunction(CAM, mode=opt.cam_mode, t=opt.cam_t), inputs[i])
+            antiCAMs = torch.mul(anti_cam, inputs[i])
         else:
-            antiCAMs = torch.cat([antiCAMs, torch.mul(antiCamFunction(CAM,mode=opt.cam_mode,t=opt.cam_t), inputs[i])], dim=0)
+            antiCAMs = torch.cat([
+                antiCAMs, torch.mul(anti_cam, inputs[i])
+            ], dim=0)
     return antiCAMs
 
 
 def antiCamFunction(CAM, mode='reverse', t=None):
-    if mode == 'reverse':
-        return 1-CAM[0].unsqueeze(0)
+    """
+    Apply anti-CAM function to reverse attention.
 
-    
+    Args:
+        CAM: Class activation map
+        mode: Processing mode
+        t: Threshold (unused in reverse mode)
+
+    Returns:
+        Reversed CAM
+    """
+    if mode == 'reverse':
+        return 1 - CAM[0].unsqueeze(0)
+
+
 def rand_bbox(size, lam):
+    """
+    Generate random bounding box for CutMix.
+
+    Args:
+        size: Image size
+        lam: Lambda parameter
+
+    Returns:
+        Bounding box coordinates (bbx1, bby1, bbx2, bby2)
+    """
     W = size[2]
     H = size[3]
     cut_rat = np.sqrt(1. - lam)
-    cut_w = np.int(W * cut_rat)
-    cut_h = np.int(H * cut_rat)
+    cut_w = int(W * cut_rat)
+    cut_h = int(H * cut_rat)
 
-    # uniform
+    # Uniform sampling
     cx = np.random.randint(W)
     cy = np.random.randint(H)
 
@@ -487,9 +586,18 @@ def rand_bbox(size, lam):
     return bbx1, bby1, bbx2, bby2
 
 
-
 def uniform_loss(x, t=2):
-  return torch.pdist(x, p=2).pow(2).mul(-t).exp().mean().log()
+    """
+    Calculate uniform loss for feature distribution.
+
+    Args:
+        x: Features
+        t: Temperature parameter
+
+    Returns:
+        Uniform loss value
+    """
+    return torch.pdist(x, p=2).pow(2).mul(-t).exp().mean().log()
 
 
 if __name__ == '__main__':

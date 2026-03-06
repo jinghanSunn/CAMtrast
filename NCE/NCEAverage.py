@@ -1,12 +1,37 @@
+"""
+Memory bank modules for contrastive learning.
+
+Implements various memory bank strategies including NCE, Instance Discrimination,
+and MoCo for contrastive learning.
+"""
+import math
+
 import torch
 from torch import nn
+
 from .alias_multinomial import AliasMethod
-import math
 
 
 class NCEAverage(nn.Module):
+    """
+    NCE memory bank with separate L and AB channels.
 
-    def __init__(self, inputSize, outputSize, K, T=0.07, momentum=0.5, use_softmax=False):
+    Used for color-based contrastive learning.
+    """
+
+    def __init__(self, inputSize, outputSize, K, T=0.07, momentum=0.5,
+                 use_softmax=False):
+        """
+        Initialize NCE memory bank.
+
+        Args:
+            inputSize: Feature dimension
+            outputSize: Number of samples in memory bank
+            K: Number of negative samples
+            T: Temperature parameter
+            momentum: Momentum for memory update
+            use_softmax: Whether to use softmax (InfoNCE) or NCE
+        """
         super(NCEAverage, self).__init__()
         self.nLem = outputSize
         self.unigrams = torch.ones(self.nLem)
@@ -17,10 +42,28 @@ class NCEAverage(nn.Module):
 
         self.register_buffer('params', torch.tensor([K, T, -1, -1, momentum]))
         stdv = 1. / math.sqrt(inputSize / 3)
-        self.register_buffer('memory_l', torch.rand(outputSize, inputSize).mul_(2 * stdv).add_(-stdv))
-        self.register_buffer('memory_ab', torch.rand(outputSize, inputSize).mul_(2 * stdv).add_(-stdv))
+        self.register_buffer(
+            'memory_l',
+            torch.rand(outputSize, inputSize).mul_(2 * stdv).add_(-stdv)
+        )
+        self.register_buffer(
+            'memory_ab',
+            torch.rand(outputSize, inputSize).mul_(2 * stdv).add_(-stdv)
+        )
 
     def forward(self, l, ab, y, idx=None):
+        """
+        Forward pass with L and AB features.
+
+        Args:
+            l: L channel features
+            ab: AB channel features
+            y: Sample indices
+            idx: Optional pre-computed negative sample indices
+
+        Returns:
+            Tuple of (out_l, out_ab) similarity scores
+        """
         K = int(self.params[0].item())
         T = self.params[1].item()
         Z_l = self.params[2].item()
@@ -31,15 +74,19 @@ class NCEAverage(nn.Module):
         outputSize = self.memory_l.size(0)
         inputSize = self.memory_l.size(1)
 
-        # score computation
+        # Score computation
         if idx is None:
-            idx = self.multinomial.draw(batchSize * (self.K + 1)).view(batchSize, -1)
+            idx = self.multinomial.draw(batchSize * (self.K + 1)).view(
+                batchSize, -1
+            )
             idx.select(1, 0).copy_(y.data)
-        # sample
+
+        # Sample from memory_l and compute AB similarities
         weight_l = torch.index_select(self.memory_l, 0, idx.view(-1)).detach()
         weight_l = weight_l.view(batchSize, K + 1, inputSize)
         out_ab = torch.bmm(weight_l, ab.view(batchSize, inputSize, 1))
-        # sample
+
+        # Sample from memory_ab and compute L similarities
         weight_ab = torch.index_select(self.memory_ab, 0, idx.view(-1)).detach()
         weight_ab = weight_ab.view(batchSize, K + 1, inputSize)
         out_l = torch.bmm(weight_ab, l.view(batchSize, inputSize, 1))
@@ -52,21 +99,22 @@ class NCEAverage(nn.Module):
         else:
             out_ab = torch.exp(torch.div(out_ab, T))
             out_l = torch.exp(torch.div(out_l, T))
-            # set Z_0 if haven't been set yet,
-            # Z_0 is used as a constant approximation of Z, to scale the probs
+
+            # Set normalization constant Z if not initialized
             if Z_l < 0:
                 self.params[2] = out_l.mean() * outputSize
                 Z_l = self.params[2].clone().detach().item()
-                print("normalization constant Z_l is set to {:.1f}".format(Z_l))
+                print("Normalization constant Z_l set to {:.1f}".format(Z_l))
             if Z_ab < 0:
                 self.params[3] = out_ab.mean() * outputSize
                 Z_ab = self.params[3].clone().detach().item()
-                print("normalization constant Z_ab is set to {:.1f}".format(Z_ab))
-            # compute out_l, out_ab
+                print("Normalization constant Z_ab set to {:.1f}".format(Z_ab))
+
+            # Normalize outputs
             out_l = torch.div(out_l, Z_l).contiguous()
             out_ab = torch.div(out_ab, Z_ab).contiguous()
 
-        # # update memory
+        # Update memory with momentum
         with torch.no_grad():
             l_pos = torch.index_select(self.memory_l, 0, y.view(-1))
             l_pos.mul_(momentum)
@@ -85,13 +133,29 @@ class NCEAverage(nn.Module):
         return out_l, out_ab
 
 
-# =========================
-# InsDis and MoCo
-# =========================
+# Instance Discrimination and MoCo memory banks
 
 class MemoryInsDis(nn.Module):
-    """Memory bank with instance discrimination"""
-    def __init__(self, inputSize, outputSize, K, T=0.07, momentum=0.5, use_softmax=False):
+    """
+    Memory bank for instance discrimination.
+
+    Implements the memory bank from "Unsupervised Feature Learning via
+    Non-Parametric Instance Discrimination".
+    """
+
+    def __init__(self, inputSize, outputSize, K, T=0.07, momentum=0.5,
+                 use_softmax=False):
+        """
+        Initialize instance discrimination memory bank.
+
+        Args:
+            inputSize: Feature dimension
+            outputSize: Number of samples in memory bank
+            K: Number of negative samples
+            T: Temperature parameter
+            momentum: Momentum for memory update
+            use_softmax: Whether to use softmax (InfoNCE) or NCE
+        """
         super(MemoryInsDis, self).__init__()
         self.nLem = outputSize
         self.unigrams = torch.ones(self.nLem)
@@ -102,9 +166,23 @@ class MemoryInsDis(nn.Module):
 
         self.register_buffer('params', torch.tensor([K, T, -1, momentum]))
         stdv = 1. / math.sqrt(inputSize / 3)
-        self.register_buffer('memory', torch.rand(outputSize, inputSize).mul_(2 * stdv).add_(-stdv))
+        self.register_buffer(
+            'memory',
+            torch.rand(outputSize, inputSize).mul_(2 * stdv).add_(-stdv)
+        )
 
     def forward(self, x, y, idx=None):
+        """
+        Forward pass for instance discrimination.
+
+        Args:
+            x: Input features
+            y: Sample indices
+            idx: Optional pre-computed negative sample indices
+
+        Returns:
+            Similarity scores
+        """
         K = int(self.params[0].item())
         T = self.params[1].item()
         Z = self.params[2].item()
@@ -114,12 +192,14 @@ class MemoryInsDis(nn.Module):
         outputSize = self.memory.size(0)
         inputSize = self.memory.size(1)
 
-        # score computation
+        # Score computation
         if idx is None:
-            idx = self.multinomial.draw(batchSize * (self.K + 1)).view(batchSize, -1)
+            idx = self.multinomial.draw(batchSize * (self.K + 1)).view(
+                batchSize, -1
+            )
             idx.select(1, 0).copy_(y.data)
 
-        # sample
+        # Sample from memory
         weight = torch.index_select(self.memory, 0, idx.view(-1))
         weight = weight.view(batchSize, K + 1, inputSize)
         out = torch.bmm(weight, x.view(batchSize, inputSize, 1))
@@ -132,11 +212,11 @@ class MemoryInsDis(nn.Module):
             if Z < 0:
                 self.params[2] = out.mean() * outputSize
                 Z = self.params[2].clone().detach().item()
-                print("normalization constant Z is set to {:.1f}".format(Z))
-            # compute the out
+                print("Normalization constant Z set to {:.1f}".format(Z))
+            # Normalize output
             out = torch.div(out, Z).squeeze().contiguous()
 
-        # # update memory
+        # Update memory with momentum
         with torch.no_grad():
             weight_pos = torch.index_select(self.memory, 0, y.view(-1))
             weight_pos.mul_(momentum)
@@ -149,8 +229,24 @@ class MemoryInsDis(nn.Module):
 
 
 class MemoryMoCo(nn.Module):
-    """Fixed-size queue with momentum encoder"""
+    """
+    MoCo memory queue.
+
+    Implements the fixed-size queue from "Momentum Contrast for Unsupervised
+    Visual Representation Learning".
+    """
+
     def __init__(self, inputSize, outputSize, K, T=0.07, use_softmax=False):
+        """
+        Initialize MoCo memory queue.
+
+        Args:
+            inputSize: Feature dimension
+            outputSize: Output size (for normalization)
+            K: Queue size
+            T: Temperature parameter
+            use_softmax: Whether to use softmax (InfoNCE) or NCE
+        """
         super(MemoryMoCo, self).__init__()
         self.outputSize = outputSize
         self.inputSize = inputSize
@@ -161,19 +257,33 @@ class MemoryMoCo(nn.Module):
 
         self.register_buffer('params', torch.tensor([-1]))
         stdv = 1. / math.sqrt(inputSize / 3)
-        self.register_buffer('memory', torch.rand(self.queueSize, inputSize).mul_(2 * stdv).add_(-stdv))
-        print('using queue shape: ({},{})'.format(self.queueSize, inputSize))
+        self.register_buffer(
+            'memory',
+            torch.rand(self.queueSize, inputSize).mul_(2 * stdv).add_(-stdv)
+        )
+        print('Using queue shape: ({}, {})'.format(self.queueSize, inputSize))
 
     def forward(self, q, k):
+        """
+        Forward pass for MoCo.
+
+        Args:
+            q: Query features from online encoder
+            k: Key features from momentum encoder
+
+        Returns:
+            Similarity scores
+        """
         batchSize = q.shape[0]
         k = k.detach()
 
         Z = self.params[0].item()
 
-        # pos logit
+        # Positive logits
         l_pos = torch.bmm(q.view(batchSize, 1, -1), k.view(batchSize, -1, 1))
         l_pos = l_pos.view(batchSize, 1)
-        # neg logit
+
+        # Negative logits from queue
         queue = self.memory.clone()
         l_neg = torch.mm(queue.detach(), q.transpose(1, 0))
         l_neg = l_neg.transpose(0, 1)
@@ -188,11 +298,11 @@ class MemoryMoCo(nn.Module):
             if Z < 0:
                 self.params[0] = out.mean() * self.outputSize
                 Z = self.params[0].clone().detach().item()
-                print("normalization constant Z is set to {:.1f}".format(Z))
-            # compute the out
+                print("Normalization constant Z set to {:.1f}".format(Z))
+            # Normalize output
             out = torch.div(out, Z).squeeze().contiguous()
 
-        # # update memory
+        # Update queue
         with torch.no_grad():
             out_ids = torch.arange(batchSize).cuda()
             out_ids += self.index
@@ -204,8 +314,23 @@ class MemoryMoCo(nn.Module):
         return out
 
 class MemoryMoCoSup(nn.Module):
-    """Fixed-size queue with momentum encoder"""
+    """
+    Supervised MoCo memory queue.
+
+    MoCo queue with label tracking to exclude same-class negatives.
+    """
+
     def __init__(self, inputSize, outputSize, K, T=0.07, use_softmax=False):
+        """
+        Initialize supervised MoCo memory queue.
+
+        Args:
+            inputSize: Feature dimension
+            outputSize: Output size (for normalization)
+            K: Queue size
+            T: Temperature parameter
+            use_softmax: Whether to use softmax (InfoNCE) or NCE
+        """
         super(MemoryMoCoSup, self).__init__()
         self.outputSize = outputSize
         self.inputSize = inputSize
@@ -216,37 +341,49 @@ class MemoryMoCoSup(nn.Module):
 
         self.register_buffer('params', torch.tensor([-1]))
         stdv = 1. / math.sqrt(inputSize / 3)
-        self.register_buffer('memory', torch.rand(self.queueSize, inputSize).mul_(2 * stdv).add_(-stdv))
-        self.register_buffer('memory_label', torch.full((self.queueSize,1), (-1)))
-        print('using queue shape: ({},{})'.format(self.queueSize, inputSize))
+        self.register_buffer(
+            'memory',
+            torch.rand(self.queueSize, inputSize).mul_(2 * stdv).add_(-stdv)
+        )
+        self.register_buffer(
+            'memory_label',
+            torch.full((self.queueSize, 1), (-1))
+        )
+        print('Using queue shape: ({}, {})'.format(self.queueSize, inputSize))
 
     def forward(self, q, k, label):
-        '''
-        q: [bs, 128]
-        '''
+        """
+        Forward pass for supervised MoCo.
+
+        Args:
+            q: Query features from online encoder [batch_size, feature_dim]
+            k: Key features from momentum encoder [batch_size, feature_dim]
+            label: Class labels [batch_size]
+
+        Returns:
+            Similarity scores with same-class negatives masked
+        """
         batchSize = q.shape[0]
         k = k.detach()
         label = label.detach().float()
-        # print(label)
 
         Z = self.params[0].item()
-        # print("q",q.shape)
-        # print("k", k.shape)
-        # pos logit
+
+        # Positive logits
         l_pos = torch.bmm(q.view(batchSize, 1, -1), k.view(batchSize, -1, 1))
         l_pos = l_pos.view(batchSize, 1)
-        # neg logit
-        queue = self.memory.clone() # [2048, 128]
+
+        # Negative logits from queue
+        queue = self.memory.clone()
         l_neg = torch.mm(queue.detach(), q.transpose(1, 0))
-        l_neg = l_neg.transpose(0, 1) # [bs, 2048]
-        # l_neg[:, self.memory_label==label] = torch.zeros((self.queueSize))
+        l_neg = l_neg.transpose(0, 1)
+
+        # Mask out same-class negatives
         for i in range(len(l_neg)):
-            # print((self.memory_label.squeeze()==label[i]).squeeze().sum())
-            l_neg[i][(self.memory_label.squeeze()==label[i]).squeeze()] = 0
-       
+            l_neg[i][(self.memory_label.squeeze() == label[i]).squeeze()] = 0
 
         out = torch.cat((l_pos, l_neg), dim=1)
-        # print(out.shape)
+
         if self.use_softmax:
             out = torch.div(out, self.T)
             out = out.squeeze().contiguous()
@@ -255,15 +392,11 @@ class MemoryMoCoSup(nn.Module):
             if Z < 0:
                 self.params[0] = out.mean() * self.outputSize
                 Z = self.params[0].clone().detach().item()
-                print("normalization constant Z is set to {:.1f}".format(Z))
-            # compute the out
+                print("Normalization constant Z set to {:.1f}".format(Z))
+            # Normalize output
             out = torch.div(out, Z).squeeze().contiguous()
 
-        # print(self.memory_label.shape) # [2048, 1]
-        # print(label.shape) # bs
-        # print(self.memory.shape) # [2048, 128]
-        # print(k.shape) # [bs, 128]
-        # # update memory
+        # Update queue with features and labels
         with torch.no_grad():
             out_ids = torch.arange(batchSize).cuda()
             out_ids += self.index
